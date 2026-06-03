@@ -1,6 +1,7 @@
 (ns clojure-mcp-light.hook-test
   (:require [clojure.test :refer [deftest is testing]]
             [clojure-mcp-light.hook :as hook]
+            [clojure-mcp-light.tmp :as tmp]
             [babashka.fs :as fs]))
 
 (deftest clojure-file?-test
@@ -98,3 +99,69 @@
                       :session_id "test-session"}
           result (hook/process-hook hook-input)]
       (is (nil? result)))))
+
+(deftest cli-hook-format-test
+  (testing "defaults to Claude hook format"
+    (is (= :claude (:hook-format (hook/handle-cli-args [])))))
+
+  (testing "accepts Codex shortcut flag"
+    (is (= :codex (:hook-format (hook/handle-cli-args ["--codex"])))))
+
+  (testing "accepts Claude shortcut flag"
+    (is (= :claude (:hook-format (hook/handle-cli-args ["--claude"]))))))
+
+(deftest codex-apply-patch-operations-test
+  (testing "parses add update delete and move file operations"
+    (is (= [{:op :update :from "src/foo.clj" :to "src/bar.clj"}
+            {:op :add :from nil :to "src/new.clj"}
+            {:op :delete :from "src/old.clj" :to nil}]
+           (hook/codex-apply-patch-operations
+            "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: src/foo.clj\n*** Move to: src/bar.clj\n@@\n-(def x 1)\n+(def x 2)\n*** Add File: src/new.clj\n+(def y 1)\n*** Delete File: src/old.clj\n*** End Patch\nPATCH")))))
+
+(deftest codex-process-hook-test
+  (testing "fixes Clojure files after Codex apply_patch"
+    (let [temp-file (str (fs/create-temp-file {:prefix "codex-hook-" :suffix ".clj"}))
+          command (str "*** Begin Patch\n"
+                       "*** Update File: " temp-file "\n"
+                       "@@\n"
+                       "-(def x 1)\n"
+                       "+(def x 1\n"
+                       "*** End Patch\n")]
+      (try
+        (spit temp-file "(def x 1" :encoding "UTF-8")
+        (let [hook-input {:hook_event_name "PostToolUse"
+                          :tool_name "apply_patch"
+                          :tool_input {:command command}
+                          :session_id "codex-fix-session"}
+              result (binding [hook/*hook-format* :codex]
+                       (hook/process-hook hook-input))]
+          (is (nil? result))
+          (is (= "(def x 1)" (slurp temp-file :encoding "UTF-8"))))
+        (finally
+          (fs/delete-if-exists temp-file)
+          (tmp/cleanup-session! {:session-id "codex-fix-session"})))))
+
+  (testing "backs up files before Codex apply_patch"
+    (let [temp-file (str (fs/create-temp-file {:prefix "codex-hook-backup-" :suffix ".clj"}))
+          session-id "codex-backup-session"
+          command (str "*** Begin Patch\n"
+                       "*** Update File: " temp-file "\n"
+                       "@@\n"
+                       "-(def x 1)\n"
+                       "+(def x 2)\n"
+                       "*** End Patch\n")
+          backup-path (tmp/backup-path {:session-id session-id} temp-file)]
+      (try
+        (spit temp-file "(def x 1)" :encoding "UTF-8")
+        (let [hook-input {:hook_event_name "PreToolUse"
+                          :tool_name "apply_patch"
+                          :tool_input {:command command}
+                          :session_id session-id}
+              result (binding [hook/*hook-format* :codex]
+                       (hook/process-hook hook-input))]
+          (is (nil? result))
+          (is (fs/exists? backup-path))
+          (is (= "(def x 1)" (slurp backup-path :encoding "UTF-8"))))
+        (finally
+          (fs/delete-if-exists temp-file)
+          (tmp/cleanup-session! {:session-id session-id}))))))

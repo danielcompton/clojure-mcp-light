@@ -2,7 +2,7 @@
                                  parinferish/parinferish {:mvn/version "0.8.0"}}})
 
 (ns clojure-mcp-light.hook
-  "Claude Code hook for delimiter error detection and repair"
+  "Claude Code and Codex hook for delimiter error detection and repair"
   (:require [babashka.fs :as fs]
             [cheshire.core :as json]
             [cljfmt.core :as cljfmt]
@@ -22,13 +22,20 @@
 
 (def ^:dynamic *enable-cljfmt* false)
 (def ^:dynamic *enable-revert* true)
+(def ^:dynamic *hook-format* :claude)
 
 ;; ============================================================================
 ;; CLI Options
 ;; ============================================================================
 
 (def cli-options
-  [[nil "--cljfmt" "Enable cljfmt formatting on files after edit/write"]
+  [[nil "--codex" "Use Codex hook format"
+    :id :codex
+    :default false]
+   [nil "--claude" "Use Claude Code hook format (default)"
+    :id :claude
+    :default false]
+   [nil "--cljfmt" "Enable cljfmt formatting on files after edit/write"]
    [nil "--no-revert" "Disable automatic file revert on unfixable delimiter errors"
     :id :no-revert
     :default false]
@@ -49,11 +56,13 @@
    ["-h" "--help" "Show help message"]])
 
 (defn usage []
-  (str "clj-paren-repair-claude-hook - Claude Code hook for Clojure delimiter repair\n"
+  (str "clj-paren-repair-claude-hook - Claude Code/Codex hook for Clojure delimiter repair\n"
        "\n"
        "Usage: clj-paren-repair-claude-hook [OPTIONS]\n"
        "\n"
        "Options:\n"
+       "      --codex               Use Codex hook format\n"
+       "      --claude              Use Claude Code hook format (default)\n"
        "      --cljfmt              Enable cljfmt formatting on files after edit/write\n"
        "      --no-revert           Disable automatic file revert on unfixable delimiter errors\n"
        "      --stats               Enable statistics tracking for delimiter events\n"
@@ -68,18 +77,28 @@
   (str "The following errors occurred while parsing command:\n\n"
        (string/join \newline errors)))
 
+(defn- hook-format-conflict-error [options]
+  (when (and (:codex options) (:claude options))
+    "Choose only one hook format: --claude or --codex"))
+
+(defn- normalize-hook-format [options]
+  (assoc options :hook-format (if (:codex options) :codex :claude)))
+
 (defn handle-cli-args
   "Parse CLI arguments and handle help/errors. Returns options map or exits."
   [args]
-  (let [actual-args (if (seq args) args *command-line-args*)
-        {:keys [options errors]} (parse-opts actual-args cli-options)]
+  (let [actual-args (or args *command-line-args*)
+        {:keys [options errors]} (parse-opts actual-args cli-options)
+        format-error (hook-format-conflict-error options)
+        errors (cond-> (vec errors)
+                 format-error (conj format-error))]
     (cond
       (:help options)
       (do
         (println (usage))
         (System/exit 0))
 
-      errors
+      (seq errors)
       (do
         (binding [*out* *err*]
           (println (error-msg errors))
@@ -88,10 +107,10 @@
         (System/exit 1))
 
       :else
-      options)))
+      (normalize-hook-format options))))
 
 ;; ============================================================================
-;; Claude Code Hook Functions
+;; Hook Functions
 ;; ============================================================================
 
 (defn- babashka-shebang?
@@ -285,13 +304,164 @@
         (finally
           (delete-backup backup-file))))))
 
+(defn- apply-patch-path [line prefix]
+  (subs line (count prefix)))
+
+(defn- finish-apply-patch-op [{:keys [current] :as state}]
+  (cond-> state
+    current (-> (update :ops conj current)
+                (dissoc :current))))
+
+(defn codex-apply-patch-operations
+  "Parse Codex apply_patch command text into touched file operations.
+
+   Returns maps with:
+   - :op   - one of :add, :update, or :delete
+   - :from - original path for update/delete
+   - :to   - final path for add/update/move"
+  [command]
+  (let [lines (string/split-lines (or command ""))
+        patch-lines (if-let [begin-index (first (keep-indexed (fn [idx line]
+                                                                 (when (= "*** Begin Patch" line)
+                                                                   idx))
+                                                               lines))]
+                      (drop begin-index lines)
+                      lines)
+        state (reduce
+               (fn [state line]
+                 (cond
+                   (string/starts-with? line "*** Add File: ")
+                   (-> state
+                       finish-apply-patch-op
+                       (assoc :current {:op :add
+                                        :from nil
+                                        :to (apply-patch-path line "*** Add File: ")}))
+
+                   (string/starts-with? line "*** Update File: ")
+                   (-> state
+                       finish-apply-patch-op
+                       (assoc :current (let [path (apply-patch-path line "*** Update File: ")]
+                                         {:op :update
+                                          :from path
+                                          :to path})))
+
+                   (string/starts-with? line "*** Delete File: ")
+                   (-> state
+                       finish-apply-patch-op
+                       (assoc :current {:op :delete
+                                        :from (apply-patch-path line "*** Delete File: ")
+                                        :to nil}))
+
+                   (string/starts-with? line "*** Move to: ")
+                   (assoc-in state [:current :to] (apply-patch-path line "*** Move to: "))
+
+                   (= "*** End Patch" line)
+                   (finish-apply-patch-op state)
+
+                   :else
+                   state))
+               {:ops []}
+               patch-lines)]
+    (:ops (finish-apply-patch-op state))))
+
+(defn- codex-apply-patch-backup-paths [ops]
+  (->> ops
+       (keep :from)
+       (filter clojure-file?)
+       distinct))
+
+(defn- codex-apply-patch-final-paths [ops]
+  (->> ops
+       (keep :to)
+       (filter clojure-file?)
+       distinct))
+
+(defn- delete-file-if-exists [file-path]
+  (when (fs/exists? file-path)
+    (fs/delete file-path)))
+
+(defn- restore-codex-apply-patch-op! [session-id {:keys [op from to]}]
+  (let [backup (when from
+                 (tmp/backup-path {:session-id session-id} from))
+        backup-exists? (and backup (fs/exists? backup))]
+    (case op
+      :add
+      (when to
+        (delete-file-if-exists to))
+
+      :delete
+      (when backup-exists?
+        (restore-file from backup))
+
+      :update
+      (when backup-exists?
+        (restore-file from backup)
+        (when (and to from (not= to from))
+          (delete-file-if-exists to)))
+
+      nil)))
+
+(defn- delete-codex-apply-patch-backups! [session-id ops]
+  (doseq [file-path (codex-apply-patch-backup-paths ops)]
+    (let [backup (tmp/backup-path {:session-id session-id} file-path)]
+      (when (fs/exists? backup)
+        (delete-backup backup)))))
+
+(defn- codex-apply-patch-clojure-ops [ops]
+  (filter (fn [{:keys [from to]}]
+            (or (and from (clojure-file? from))
+                (and to (clojure-file? to))))
+          ops))
+
+(defn- process-codex-pre-apply-patch [{:keys [tool_input session_id]}]
+  (let [ops (codex-apply-patch-operations (:command tool_input))]
+    (when *enable-revert*
+      (doseq [file-path (codex-apply-patch-backup-paths ops)]
+        (when (fs/exists? file-path)
+          (try
+            (let [backup (backup-file file-path session_id)]
+              (timbre/debug "  Created Codex apply_patch backup:" backup))
+            (catch Exception e
+              (timbre/debug "  Codex apply_patch backup failed:" (.getMessage e)))))))
+    nil))
+
+(defn- process-codex-post-apply-patch [{:keys [tool_input session_id]}]
+  (let [ops (codex-apply-patch-operations (:command tool_input))
+        clojure-ops (vec (codex-apply-patch-clojure-ops ops))
+        final-paths (filter fs/exists? (codex-apply-patch-final-paths clojure-ops))]
+    (try
+      (let [results (mapv (fn [file-path]
+                            {:file-path file-path
+                             :result (fix-and-format-file! file-path
+                                                           *enable-cljfmt*
+                                                           "PostToolUse:apply_patch")})
+                          final-paths)
+            failures (filter (comp not :success :result) results)]
+        (when (seq failures)
+          (if *enable-revert*
+            (do
+              (doseq [op clojure-ops]
+                (restore-codex-apply-patch-op! session_id op))
+              {:decision "block"
+               :reason (str "Delimiter errors could not be auto-fixed. Clojure files touched by apply_patch were restored.")
+               :hookSpecificOutput
+               {:hookEventName "PostToolUse"
+                :additionalContext "There are delimiter errors in one or more Clojure files touched by apply_patch. The Clojure file changes were restored from backup where possible."}})
+            {:decision "block"
+             :reason "Delimiter errors could not be auto-fixed in one or more Clojure files touched by apply_patch."
+             :hookSpecificOutput
+             {:hookEventName "PostToolUse"
+              :additionalContext "There are delimiter errors in one or more Clojure files touched by apply_patch. Revert is disabled, so the files were not restored."}})))
+      (finally
+        (delete-codex-apply-patch-backups! session_id ops)))))
+
 (defmulti process-hook
   (fn [hook-input]
-    [(:hook_event_name hook-input) (:tool_name hook-input)]))
+    [*hook-format* (:hook_event_name hook-input) (:tool_name hook-input)]))
 
 (defmethod process-hook :default [_] nil)
 
-(defmethod process-hook ["PreToolUse" "Write"]
+(defmethod process-hook [:claude "PreToolUse" "Write"]
   [{:keys [tool_input]}]
   (let [{:keys [file_path content]} tool_input]
     (when (clojure-file? file_path)
@@ -324,7 +494,7 @@
           (timbre/debug "  No delimiter errors, allowing write")
           nil)))))
 
-(defmethod process-hook ["PreToolUse" "Edit"]
+(defmethod process-hook [:claude "PreToolUse" "Edit"]
   [{:keys [tool_input session_id]}]
   (let [{:keys [file_path]} tool_input]
     (when (clojure-file? file_path)
@@ -340,7 +510,7 @@
             (timbre/debug "  Edit processing failed:" (.getMessage e))
             nil))))))
 
-(defmethod process-hook ["PostToolUse" "Write"]
+(defmethod process-hook [:claude "PostToolUse" "Write"]
   [{:keys [tool_input tool_response]}]
   (let [{:keys [file_path]} tool_input]
     (when (and (clojure-file? file_path) tool_response *enable-cljfmt*)
@@ -348,7 +518,7 @@
       (run-cljfmt file_path)
       nil)))
 
-(defmethod process-hook ["PostToolUse" "Edit"]
+(defmethod process-hook [:claude "PostToolUse" "Edit"]
   [{:keys [tool_input tool_response session_id]}]
   (let [{:keys [file_path]} tool_input]
     (when (and (clojure-file? file_path) tool_response)
@@ -384,21 +554,29 @@
             (when backup-exists?
               (delete-backup backup))))))))
 
-(defmethod process-hook ["PreToolUse" "mcp__morph-mcp__edit_file"]
+(defmethod process-hook [:claude "PreToolUse" "mcp__morph-mcp__edit_file"]
   [input]
   (let [path (get-in input [:tool_input :path])]
     (process-hook (-> input
                       (assoc :tool_name "Edit")
                       (assoc-in [:tool_input :file_path] path)))))
 
-(defmethod process-hook ["PostToolUse" "mcp__morph-mcp__edit_file"]
+(defmethod process-hook [:claude "PostToolUse" "mcp__morph-mcp__edit_file"]
   [input]
   (let [path (get-in input [:tool_input :path])]
     (process-hook (-> input
                       (assoc :tool_name "Edit")
                       (assoc-in [:tool_input :file_path] path)))))
 
-(defmethod process-hook ["SessionEnd" nil]
+(defmethod process-hook [:codex "PreToolUse" "apply_patch"]
+  [input]
+  (process-codex-pre-apply-patch input))
+
+(defmethod process-hook [:codex "PostToolUse" "apply_patch"]
+  [input]
+  (process-codex-post-apply-patch input))
+
+(defmethod process-hook [:claude "SessionEnd" nil]
   [{:keys [session_id]}]
   (timbre/info "SessionEnd: cleaning up session" session_id)
   (try
@@ -432,9 +610,10 @@
                                       {:allow "clojure-mcp-light.*"}
                                       {:deny "*"}))}})
 
-    ;; Set cljfmt, revert, and stats flags from CLI options
+    ;; Set cljfmt, revert, hook format, and stats flags from CLI options
     (binding [*enable-cljfmt* (:cljfmt options)
               *enable-revert* (not (:no-revert options))
+              *hook-format* (:hook-format options)
               stats/*enable-stats* enable-stats?
               stats/*stats-file-path* stats-path]
       (try

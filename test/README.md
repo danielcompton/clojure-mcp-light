@@ -12,7 +12,7 @@ bb test
 ## Test Structure
 
 - `delimiter_repair_test.clj` - Tests for delimiter detection and repair functionality
-- `hook_test.clj` - Tests for Claude Code hook processing
+- `hook_test.clj` - Tests for Claude Code and Codex hook processing
 - `nrepl_eval_test.clj` - Tests for nREPL evaluation utilities
 
 ## Test Coverage
@@ -27,6 +27,7 @@ bb test
 - ✅ Backup path generation
 - ✅ Hook processing for Write operations
 - ✅ Hook processing for Edit operations
+- ✅ Hook processing for Codex apply_patch operations
 - ✅ Auto-fixing delimiter errors
 
 ### nrepl-eval namespace

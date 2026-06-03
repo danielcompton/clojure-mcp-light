@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Codex hook support** - `clj-paren-repair-claude-hook` now accepts `--codex` and handles Codex `apply_patch` hook input.
+- **Hook format selection** - Added `--claude` and `--codex` flags while keeping Claude Code as the default.
+
 ## [0.2.2] - 2026-03-14
 
 This release fixes the PreToolUse Write hook so delimiter repairs are actually applied, adds ClojureDart (.cljd) file support, and updates documentation to recommend heredoc for code evaluation.
